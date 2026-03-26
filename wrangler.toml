@@ -1,0 +1,26 @@
+name = "echo-timesheet"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[observability]
+enabled = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-timesheet"
+database_id = "e9a1a5ec-a752-46f0-86d1-21dd231843c0"
+
+[[kv_namespaces]]
+binding = "TS_CACHE"
+id = "9098f27c861142829afb45a272e164fd"
+
+[triggers]
+crons = ["0 0 * * 1"]
+
+[[services]]
+binding = "ENGINE_RUNTIME"
+service = "echo-engine-runtime"
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"

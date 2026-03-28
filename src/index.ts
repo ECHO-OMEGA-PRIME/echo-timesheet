@@ -51,6 +51,7 @@ export default {
     if (!(await rateLimit(ip, env.TS_CACHE))) return json({ error: 'rate limited' }, 429);
 
     try {
+      if (p === '/') return json({ service: 'echo-timesheet', version: '1.0.0', status: 'operational' });
       if (p === '/health') return json({ status: 'ok', service: 'echo-timesheet', version: '1.0.0', timestamp: new Date().toISOString() });
       if (!authOk(req, env)) return json({ error: 'unauthorized' }, 401);
       const db = env.DB;

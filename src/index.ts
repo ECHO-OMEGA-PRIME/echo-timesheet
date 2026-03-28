@@ -53,7 +53,8 @@ export default {
     try {
       if (p === '/') return json({ service: 'echo-timesheet', version: '1.0.0', status: 'operational' });
       if (p === '/health') return json({ status: 'ok', service: 'echo-timesheet', version: '1.0.0', timestamp: new Date().toISOString() });
-      if (!authOk(req, env)) return json({ error: 'unauthorized' }, 401);
+      try {
+    if (!authOk(req, env)) return json({ error: 'unauthorized' }, 401);
       const db = env.DB;
 
       /* ═══ WORKSPACES ═══ */
@@ -401,7 +402,14 @@ export default {
         return json({ workspaces: ws?.cnt || 0, members: mem?.cnt || 0, projects: proj?.cnt || 0, time_entries: entries?.cnt || 0, total_hours: fmtHours(entries?.total_sec || 0) });
       }
 
-      return json({ error: 'Not found', path: p }, 404);
+      } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Unknown error';
+      const stack = err instanceof Error ? err.stack : undefined;
+      slog('error', 'Unhandled request error', { method: m, path: p, error: msg, stack });
+      return json({ error: 'Internal server error', message: msg, path: p }, 500);
+    }
+
+    return json({ error: 'Not found', path: p }, 404);
     } catch (e: any) {
       if (e.message?.includes('JSON')) {
         return json({ error: 'Invalid JSON body' }, 400);

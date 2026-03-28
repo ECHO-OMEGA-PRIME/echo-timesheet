@@ -42,6 +42,12 @@ async function rateLimit(ip: string, kv: KVNamespace): Promise<boolean> {
 
 function fmtHours(sec: number): number { return Math.round((sec / 3600) * 100) / 100; }
 
+/* ═══ SQL INJECTION PREVENTION — COLUMN ALLOWLISTS ═══ */
+const PROJECT_STRING_FIELDS = ['name', 'code', 'color', 'status'] as const;
+const PROJECT_NUMERIC_FIELDS = ['client_id', 'budget_hours', 'budget_amount', 'hourly_rate', 'is_billable'] as const;
+const TIME_STRING_FIELDS = ['description', 'start_time', 'end_time', 'date'] as const;
+const TIME_NUMERIC_FIELDS = ['project_id', 'task_id', 'duration_sec', 'is_billable'] as const;
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     if (req.method === 'OPTIONS') return new Response(null, { headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type,X-Echo-API-Key' } });
@@ -126,13 +132,14 @@ export default {
         const fields: string[] = [];
         const vals: any[] = [];
         for (const [k, v] of Object.entries(b)) {
-          if (['name', 'code', 'color', 'status'].includes(k)) { fields.push(`${k}=?`); vals.push(sanitize(String(v), 200)); }
-          if (['client_id', 'budget_hours', 'budget_amount', 'hourly_rate', 'is_billable'].includes(k)) { fields.push(`${k}=?`); vals.push(v); }
+          if ((PROJECT_STRING_FIELDS as readonly string[]).includes(k)) { fields.push(k + '=?'); vals.push(sanitize(String(v), 200)); }
+          if ((PROJECT_NUMERIC_FIELDS as readonly string[]).includes(k)) { fields.push(k + '=?'); vals.push(v); }
         }
         if (fields.length === 0) return json({ error: 'no valid fields' }, 400);
         fields.push("updated_at=datetime('now')");
         vals.push(id);
-        await db.prepare(`UPDATE projects SET ${fields.join(',')} WHERE id=?`).bind(...vals).run();
+        const setClause = fields.join(',');
+        await db.prepare('UPDATE projects SET ' + setClause + ' WHERE id=?').bind(...vals).run();
         return json({ updated: true });
       }
 
@@ -221,9 +228,9 @@ export default {
         const fields: string[] = [];
         const vals: any[] = [];
         for (const [k, v] of Object.entries(b)) {
-          if (['description', 'start_time', 'end_time', 'date'].includes(k)) { fields.push(`${k}=?`); vals.push(sanitize(String(v), 2000)); }
-          if (['project_id', 'task_id', 'duration_sec', 'is_billable'].includes(k)) { fields.push(`${k}=?`); vals.push(v); }
-          if (k === 'tags') { fields.push(`${k}=?`); vals.push(JSON.stringify(v)); }
+          if ((TIME_STRING_FIELDS as readonly string[]).includes(k)) { fields.push(k + '=?'); vals.push(sanitize(String(v), 2000)); }
+          if ((TIME_NUMERIC_FIELDS as readonly string[]).includes(k)) { fields.push(k + '=?'); vals.push(v); }
+          if (k === 'tags') { fields.push('tags=?'); vals.push(JSON.stringify(v)); }
         }
         if (fields.length === 0) return json({ error: 'no valid fields' }, 400);
         // Recalculate duration if start/end changed
@@ -233,7 +240,8 @@ export default {
         }
         fields.push("updated_at=datetime('now')");
         vals.push(id);
-        await db.prepare(`UPDATE time_entries SET ${fields.join(',')} WHERE id=?`).bind(...vals).run();
+        const setClause = fields.join(',');
+        await db.prepare('UPDATE time_entries SET ' + setClause + ' WHERE id=?').bind(...vals).run();
         return json({ updated: true });
       }
       if (p.match(/^\/time\/(\d+)$/) && m === 'DELETE') {
@@ -313,14 +321,21 @@ export default {
         const from = url.searchParams.get('from');
         const to = url.searchParams.get('to');
         if (!wsId) return json({ error: 'workspace_id required' }, 400);
-        const dateFilter = from && to ? ' AND te.date>=? AND te.date<=?' : '';
-        const params = from && to ? [wsId, from, to] : [wsId];
+        const hasDateRange = !!(from && to);
+        const dateFilter = hasDateRange ? ' AND te.date>=? AND te.date<=?' : '';
+        const dateFilterShort = hasDateRange ? ' AND date>=? AND date<=?' : '';
+        const params = hasDateRange ? [wsId, from, to] : [wsId];
+
+        const byProjectSQL = 'SELECT p.name, p.color, COALESCE(SUM(te.duration_sec),0) as total_sec, COALESCE(SUM(CASE WHEN te.is_billable=1 THEN te.duration_sec ELSE 0 END),0) as billable_sec FROM time_entries te JOIN projects p ON te.project_id=p.id WHERE te.workspace_id=?' + dateFilter + ' GROUP BY te.project_id ORDER BY total_sec DESC';
+        const byMemberSQL = 'SELECT m.name, COALESCE(SUM(te.duration_sec),0) as total_sec, COALESCE(SUM(CASE WHEN te.is_billable=1 THEN te.duration_sec ELSE 0 END),0) as billable_sec FROM time_entries te JOIN members m ON te.member_id=m.id WHERE te.workspace_id=?' + dateFilter + ' GROUP BY te.member_id ORDER BY total_sec DESC';
+        const byDaySQL = 'SELECT te.date, COALESCE(SUM(te.duration_sec),0) as total_sec FROM time_entries te WHERE te.workspace_id=?' + dateFilter + ' GROUP BY te.date ORDER BY te.date';
+        const totalsSQL = 'SELECT COALESCE(SUM(duration_sec),0) as total, COALESCE(SUM(CASE WHEN is_billable=1 THEN duration_sec ELSE 0 END),0) as billable FROM time_entries WHERE workspace_id=?' + dateFilterShort;
 
         const [byProject, byMember, byDay, totals] = await Promise.all([
-          db.prepare(`SELECT p.name, p.color, COALESCE(SUM(te.duration_sec),0) as total_sec, COALESCE(SUM(CASE WHEN te.is_billable=1 THEN te.duration_sec ELSE 0 END),0) as billable_sec FROM time_entries te JOIN projects p ON te.project_id=p.id WHERE te.workspace_id=?${dateFilter} GROUP BY te.project_id ORDER BY total_sec DESC`).bind(...params).all(),
-          db.prepare(`SELECT m.name, COALESCE(SUM(te.duration_sec),0) as total_sec, COALESCE(SUM(CASE WHEN te.is_billable=1 THEN te.duration_sec ELSE 0 END),0) as billable_sec FROM time_entries te JOIN members m ON te.member_id=m.id WHERE te.workspace_id=?${dateFilter} GROUP BY te.member_id ORDER BY total_sec DESC`).bind(...params).all(),
-          db.prepare(`SELECT te.date, COALESCE(SUM(te.duration_sec),0) as total_sec FROM time_entries te WHERE te.workspace_id=?${dateFilter} GROUP BY te.date ORDER BY te.date`).bind(...params).all(),
-          db.prepare(`SELECT COALESCE(SUM(duration_sec),0) as total, COALESCE(SUM(CASE WHEN is_billable=1 THEN duration_sec ELSE 0 END),0) as billable FROM time_entries WHERE workspace_id=?${dateFilter}`).bind(...params).first() as any,
+          db.prepare(byProjectSQL).bind(...params).all(),
+          db.prepare(byMemberSQL).bind(...params).all(),
+          db.prepare(byDaySQL).bind(...params).all(),
+          db.prepare(totalsSQL).bind(...params).first() as any,
         ]);
 
         return json({

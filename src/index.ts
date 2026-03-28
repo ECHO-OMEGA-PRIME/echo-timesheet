@@ -20,7 +20,7 @@ function sanitize(s: unknown, max = 2000): string {
   return s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '').slice(0, max);
 }
 function authOk(req: Request, env: Env): boolean { return req.headers.get('X-Echo-API-Key') === env.ECHO_API_KEY; }
-function json(data: unknown, status = 200): Response { return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } }); }
+function json(data: unknown, status = 200): Response { return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' , 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'X-XSS-Protection': '1; mode=block', 'Referrer-Policy': 'strict-origin-when-cross-origin', 'Permissions-Policy': 'camera=(), microphone=(), geolocation=()', 'Strict-Transport-Security': 'max-age=63072000; includeSubDomains' } }); }
 async function rateLimit(ip: string, kv: KVNamespace): Promise<boolean> {
   const key = `rl:${ip}`;
   const raw = await kv.get(key);

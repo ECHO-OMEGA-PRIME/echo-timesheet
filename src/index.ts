@@ -394,9 +394,13 @@ export default {
         return json({ workspaces: ws?.cnt || 0, members: mem?.cnt || 0, projects: proj?.cnt || 0, time_entries: entries?.cnt || 0, total_hours: fmtHours(entries?.total_sec || 0) });
       }
 
-      return json({ error: 'not found' }, 404);
+      return json({ error: 'Not found', path: p }, 404);
     } catch (e: any) {
-      return json({ error: e.message || 'internal error' }, 500);
+      if (e.message?.includes('JSON')) {
+        return json({ error: 'Invalid JSON body' }, 400);
+      }
+      console.error(`[echo-timesheet] Unhandled error: ${e.message}`);
+      return json({ error: 'Internal server error' }, 500);
     }
   },
 

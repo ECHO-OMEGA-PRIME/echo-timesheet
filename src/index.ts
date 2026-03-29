@@ -1,7 +1,7 @@
 /**
- * Echo Timesheet v1.0.0
+ * Echo Timesheet v2.0.0
  * AI-Powered Time Tracking — Toggl/Harvest Alternative
- * Cloudflare Worker — D1 + KV
+ * Cloudflare Worker — D1 + KV + Stripe Payments
  */
 
 interface Env {
@@ -10,10 +10,13 @@ interface Env {
   ENGINE_RUNTIME: Fetcher;
   SHARED_BRAIN: Fetcher;
   ECHO_API_KEY: string;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
 }
 
 interface RLState { c: number; t: number }
 const WINDOW = 60_000, MAX_REQ = 120;
+const VERSION = '2.0.0';
 
 function sanitize(s: unknown, max = 2000): string {
   if (typeof s !== 'string') return '';
@@ -23,7 +26,7 @@ function authOk(req: Request, env: Env): boolean { return req.headers.get('X-Ech
 function json(data: unknown, status = 200): Response { return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'X-XSS-Protection': '1; mode=block', 'Referrer-Policy': 'strict-origin-when-cross-origin', 'Permissions-Policy': 'camera=(), microphone=(), geolocation=()', 'Strict-Transport-Security': 'max-age=63072000; includeSubDomains' } }); }
 
 function slog(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>) {
-  const entry = { ts: new Date().toISOString(), level, worker: 'echo-timesheet', version: '1.0.0', msg, ...data };
+  const entry = { ts: new Date().toISOString(), level, worker: 'echo-timesheet', version: VERSION, msg, ...data };
   if (level === 'error') console.error(JSON.stringify(entry));
   else console.log(JSON.stringify(entry));
 }
@@ -48,20 +51,169 @@ const PROJECT_NUMERIC_FIELDS = ['client_id', 'budget_hours', 'budget_amount', 'h
 const TIME_STRING_FIELDS = ['description', 'start_time', 'end_time', 'date'] as const;
 const TIME_NUMERIC_FIELDS = ['project_id', 'task_id', 'duration_sec', 'is_billable'] as const;
 
+/* ═══ STRIPE PLANS ═══ */
+const TIMESHEET_PLANS = [
+  { id: 'free', name: 'Free', price: 0, interval: 'month', features: ['1 workspace', '3 members', 'Basic reports', 'CSV export'], limits: { workspaces: 1, members: 3 } },
+  { id: 'team', name: 'Team', price: 1499, price_display: '$14.99/mo', interval: 'month', features: ['5 workspaces', '25 members', 'AI insights', 'Invoice generation', 'Priority support'], limits: { workspaces: 5, members: 25 } },
+  { id: 'business', name: 'Business', price: 3999, price_display: '$39.99/mo', interval: 'month', features: ['Unlimited workspaces', '100 members', 'Advanced analytics', 'Custom branding', 'API access', 'Dedicated support'], limits: { workspaces: -1, members: 100 } },
+  { id: 'enterprise', name: 'Enterprise', price: 9999, price_display: '$99.99/mo', interval: 'month', features: ['Unlimited everything', 'SSO/SAML', 'Audit log', 'Custom integrations', 'SLA guarantee', 'Account manager'], limits: { workspaces: -1, members: -1 } },
+];
+
+/* ═══ STRIPE SIGNATURE VERIFICATION (Web Crypto HMAC-SHA256) ═══ */
+async function verifyStripeSignature(payload: string, sigHeader: string, secret: string): Promise<boolean> {
+  try {
+    const parts: Record<string, string> = {};
+    for (const pair of sigHeader.split(',')) {
+      const [k, v] = pair.split('=');
+      parts[k.trim()] = v.trim();
+    }
+    const timestamp = parts['t'];
+    const v1Sig = parts['v1'];
+    if (!timestamp || !v1Sig) return false;
+    // Reject if timestamp is older than 5 minutes
+    const age = Math.abs(Date.now() / 1000 - parseInt(timestamp));
+    if (age > 300) return false;
+    const signedPayload = `${timestamp}.${payload}`;
+    const encoder = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(signedPayload));
+    const expected = Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+    // Constant-time comparison
+    if (expected.length !== v1Sig.length) return false;
+    let diff = 0;
+    for (let i = 0; i < expected.length; i++) diff |= expected.charCodeAt(i) ^ v1Sig.charCodeAt(i);
+    return diff === 0;
+  } catch { return false; }
+}
+
+/* ═══ STRIPE API HELPER ═══ */
+async function stripeAPI(env: Env, endpoint: string, method = 'GET', body?: Record<string, string>): Promise<any> {
+  const headers: Record<string, string> = {
+    'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}`,
+    'Content-Type': 'application/x-www-form-urlencoded',
+  };
+  const opts: RequestInit = { method, headers };
+  if (body) {
+    opts.body = new URLSearchParams(body).toString();
+  }
+  const resp = await fetch(`https://api.stripe.com/v1${endpoint}`, opts);
+  return resp.json();
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     if (req.method === 'OPTIONS') return new Response(null, { headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type,X-Echo-API-Key' } });
     const url = new URL(req.url);
     const p = url.pathname, m = req.method;
     const ip = req.headers.get('CF-Connecting-IP') || '0';
+
+    /* ═══ STRIPE WEBHOOK — NO AUTH, NO RATE LIMIT ═══ */
+    if (p === '/webhooks/stripe' && m === 'POST') {
+      return handleStripeWebhook(req, env);
+    }
+
     if (!(await rateLimit(ip, env.TS_CACHE))) return json({ error: 'rate limited' }, 429);
 
     try {
-      if (p === '/') return json({ service: 'echo-timesheet', version: '1.0.0', status: 'operational' });
-      if (p === '/health') return json({ status: 'ok', service: 'echo-timesheet', version: '1.0.0', timestamp: new Date().toISOString() });
+      if (p === '/') return json({ service: 'echo-timesheet', version: VERSION, status: 'operational', stripe: !!env.STRIPE_SECRET_KEY });
+      if (p === '/health') {
+        let dbOk = false;
+        try { await env.DB.prepare('SELECT 1').first(); dbOk = true; } catch {}
+        return json({
+          status: dbOk ? 'ok' : 'degraded',
+          service: 'echo-timesheet',
+          version: VERSION,
+          timestamp: new Date().toISOString(),
+          checks: {
+            d1: dbOk ? 'connected' : 'error',
+            stripe: env.STRIPE_SECRET_KEY ? 'configured' : 'not_configured',
+            stripe_webhooks: env.STRIPE_WEBHOOK_SECRET ? 'configured' : 'not_configured',
+          },
+        });
+      }
+
+      /* ═══ PUBLIC: PLANS (no auth required) ═══ */
+      if (p === '/plans' && m === 'GET') {
+        return json({ plans: TIMESHEET_PLANS.map(pl => ({ ...pl, price_cents: pl.price })) });
+      }
+
       try {
     if (!authOk(req, env)) return json({ error: 'unauthorized' }, 401);
       const db = env.DB;
+
+      /* ═══ STRIPE PLAN UPGRADE ═══ */
+      if (p === '/plans/upgrade' && m === 'POST') {
+        if (!env.STRIPE_SECRET_KEY) return json({ error: 'Stripe not configured' }, 503);
+        const b = await req.json() as any;
+        const { workspace_id, plan_id, email, success_url, cancel_url } = b;
+        if (!workspace_id || !plan_id || !email) return json({ error: 'workspace_id, plan_id, email required' }, 400);
+        const plan = TIMESHEET_PLANS.find(pl => pl.id === plan_id);
+        if (!plan) return json({ error: 'Invalid plan' }, 400);
+        if (plan.price === 0) return json({ error: 'Free plan does not require payment' }, 400);
+
+        // Create Stripe Checkout Session
+        const session = await stripeAPI(env, '/checkout/sessions', 'POST', {
+          'mode': 'subscription',
+          'payment_method_types[0]': 'card',
+          'line_items[0][price_data][currency]': 'usd',
+          'line_items[0][price_data][product_data][name]': `Echo Timesheet ${plan.name}`,
+          'line_items[0][price_data][product_data][description]': plan.features.join(', '),
+          'line_items[0][price_data][recurring][interval]': plan.interval,
+          'line_items[0][price_data][unit_amount]': plan.price.toString(),
+          'line_items[0][quantity]': '1',
+          'customer_email': email,
+          'success_url': success_url || 'https://echo-ept.com/timesheet/success?session_id={CHECKOUT_SESSION_ID}',
+          'cancel_url': cancel_url || 'https://echo-ept.com/timesheet/pricing',
+          'metadata[workspace_id]': workspace_id.toString(),
+          'metadata[plan_id]': plan_id,
+          'metadata[worker]': 'echo-timesheet',
+        });
+
+        if (session.error) {
+          slog('error', 'Stripe checkout create failed', { error: session.error.message });
+          return json({ error: 'Payment session creation failed', detail: session.error.message }, 502);
+        }
+
+        slog('info', 'Stripe checkout session created', { workspace_id, plan_id, session_id: session.id });
+        return json({ checkout_url: session.url, session_id: session.id });
+      }
+
+      /* ═══ ADMIN: MIGRATE STRIPE TABLES ═══ */
+      if (p === '/admin/migrate-stripe' && m === 'POST') {
+        await db.batch([
+          db.prepare(`CREATE TABLE IF NOT EXISTS subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workspace_id INTEGER NOT NULL,
+            plan_id TEXT NOT NULL DEFAULT 'free',
+            stripe_customer_id TEXT,
+            stripe_subscription_id TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            current_period_start TEXT,
+            current_period_end TEXT,
+            cancel_at_period_end INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(workspace_id)
+          )`),
+          db.prepare(`CREATE TABLE IF NOT EXISTS payment_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workspace_id INTEGER,
+            stripe_event_id TEXT UNIQUE,
+            event_type TEXT NOT NULL,
+            amount_cents INTEGER,
+            currency TEXT DEFAULT 'usd',
+            status TEXT,
+            metadata TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+          )`),
+          db.prepare(`CREATE INDEX IF NOT EXISTS idx_sub_workspace ON subscriptions(workspace_id)`),
+          db.prepare(`CREATE INDEX IF NOT EXISTS idx_sub_stripe ON subscriptions(stripe_subscription_id)`),
+          db.prepare(`CREATE INDEX IF NOT EXISTS idx_payment_event ON payment_events(stripe_event_id)`),
+          db.prepare(`CREATE INDEX IF NOT EXISTS idx_payment_workspace ON payment_events(workspace_id)`),
+        ]);
+        slog('info', 'Stripe migration complete');
+        return json({ migrated: true, tables: ['subscriptions', 'payment_events'] });
+      }
 
       /* ═══ WORKSPACES ═══ */
       if (p === '/workspaces' && m === 'GET') { return json({ workspaces: (await db.prepare('SELECT * FROM workspaces ORDER BY name').all()).results }); }
@@ -444,3 +596,104 @@ export default {
     }
   },
 };
+
+/* ═══ STRIPE WEBHOOK HANDLER (extracted for clarity) ═══ */
+async function handleStripeWebhook(req: Request, env: Env): Promise<Response> {
+  const body = await req.text();
+  const sigHeader = req.headers.get('stripe-signature') || '';
+
+  if (env.STRIPE_WEBHOOK_SECRET) {
+    const valid = await verifyStripeSignature(body, sigHeader, env.STRIPE_WEBHOOK_SECRET);
+    if (!valid) {
+      slog('warn', 'Stripe webhook signature verification failed');
+      return json({ error: 'Invalid signature' }, 401);
+    }
+  }
+
+  let event: any;
+  try { event = JSON.parse(body); } catch { return json({ error: 'Invalid JSON' }, 400); }
+
+  const eventType = event.type;
+  const eventId = event.id;
+  slog('info', 'Stripe webhook received', { event_type: eventType, event_id: eventId });
+
+  const db = env.DB;
+
+  try {
+    // Idempotency: skip if we already processed this event
+    const existing = await db.prepare('SELECT id FROM payment_events WHERE stripe_event_id=?').bind(eventId).first();
+    if (existing) return json({ received: true, duplicate: true });
+
+    if (eventType === 'checkout.session.completed') {
+      const session = event.data.object;
+      const wsId = session.metadata?.workspace_id;
+      const planId = session.metadata?.plan_id;
+      const customerId = session.customer;
+      const subscriptionId = session.subscription;
+
+      if (wsId && planId) {
+        await db.prepare(`INSERT OR REPLACE INTO subscriptions (workspace_id,plan_id,stripe_customer_id,stripe_subscription_id,status,current_period_start,updated_at)
+          VALUES (?,?,?,?,'active',datetime('now'),datetime('now'))`).bind(wsId, planId, customerId, subscriptionId).run();
+        slog('info', 'Subscription activated', { workspace_id: wsId, plan_id: planId });
+      }
+    }
+
+    if (eventType === 'customer.subscription.updated') {
+      const sub = event.data.object;
+      const subId = sub.id;
+      const status = sub.status;
+      const cancelAt = sub.cancel_at_period_end ? 1 : 0;
+      const periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000).toISOString() : null;
+      await db.prepare(`UPDATE subscriptions SET status=?, cancel_at_period_end=?, current_period_end=?, updated_at=datetime('now') WHERE stripe_subscription_id=?`).bind(status, cancelAt, periodEnd, subId).run();
+      slog('info', 'Subscription updated', { subscription_id: subId, status });
+    }
+
+    if (eventType === 'customer.subscription.deleted') {
+      const sub = event.data.object;
+      await db.prepare(`UPDATE subscriptions SET status='canceled', plan_id='free', updated_at=datetime('now') WHERE stripe_subscription_id=?`).bind(sub.id).run();
+      slog('info', 'Subscription canceled', { subscription_id: sub.id });
+    }
+
+    if (eventType === 'invoice.payment_succeeded') {
+      const invoice = event.data.object;
+      const subId = invoice.subscription;
+      const amountCents = invoice.amount_paid;
+      // Find workspace from subscription
+      const sub = await db.prepare('SELECT workspace_id FROM subscriptions WHERE stripe_subscription_id=?').bind(subId).first() as any;
+      if (sub) {
+        await db.prepare('INSERT INTO payment_events (workspace_id,stripe_event_id,event_type,amount_cents,currency,status,metadata) VALUES (?,?,?,?,?,?,?)').bind(
+          sub.workspace_id, eventId, eventType, amountCents, invoice.currency || 'usd', 'succeeded',
+          JSON.stringify({ invoice_id: invoice.id, period_start: invoice.period_start, period_end: invoice.period_end })
+        ).run();
+      }
+    }
+
+    if (eventType === 'invoice.payment_failed') {
+      const invoice = event.data.object;
+      const subId = invoice.subscription;
+      const sub = await db.prepare('SELECT workspace_id FROM subscriptions WHERE stripe_subscription_id=?').bind(subId).first() as any;
+      if (sub) {
+        await db.prepare(`UPDATE subscriptions SET status='past_due', updated_at=datetime('now') WHERE workspace_id=?`).bind(sub.workspace_id).run();
+        await db.prepare('INSERT INTO payment_events (workspace_id,stripe_event_id,event_type,amount_cents,currency,status,metadata) VALUES (?,?,?,?,?,?,?)').bind(
+          sub.workspace_id, eventId, eventType, invoice.amount_due, invoice.currency || 'usd', 'failed',
+          JSON.stringify({ invoice_id: invoice.id, attempt_count: invoice.attempt_count })
+        ).run();
+        slog('warn', 'Payment failed', { workspace_id: sub.workspace_id, subscription_id: subId });
+      }
+    }
+
+    // Log all events for audit
+    if (!['invoice.payment_succeeded', 'invoice.payment_failed'].includes(eventType)) {
+      const wsId = event.data?.object?.metadata?.workspace_id || null;
+      await db.prepare('INSERT OR IGNORE INTO payment_events (workspace_id,stripe_event_id,event_type,status,metadata) VALUES (?,?,?,?,?)').bind(
+        wsId, eventId, eventType, 'processed', JSON.stringify({ object_id: event.data?.object?.id })
+      ).run();
+    }
+
+  } catch (err: any) {
+    slog('error', 'Stripe webhook processing error', { event_type: eventType, error: err.message });
+    // Still return 200 to prevent Stripe retries on DB errors for processed events
+  }
+
+  return json({ received: true });
+}
